@@ -17,7 +17,6 @@ import (
 	"github.com/gitleaks/go-gitdiff/gitdiff"
 	"github.com/h2non/filetype"
 	ahocorasick "github.com/petar-dambovaliev/aho-corasick"
-	"github.com/rs/zerolog/log"
 	"github.com/spf13/viper"
 )
 
@@ -319,7 +318,6 @@ func (d *Detector) DetectGit(source string, logOpts string, gitScanType GitScanT
 	if err := s.Wait(); err != nil {
 		return d.findings, err
 	}
-	log.Debug().Msgf("%d commits scanned. Note: this number might be smaller than expected due to commits with no additions", len(d.commitMap))
 	return d.findings, nil
 }
 

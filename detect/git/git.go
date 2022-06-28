@@ -1,112 +1,114 @@
 package git
 
 import (
-	"bufio"
-	"io"
-	"os"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"math"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gitleaks/go-gitdiff/gitdiff"
-	"github.com/rs/zerolog/log"
 )
 
 // GitLog returns a channel of gitdiff.File objects from the
 // git log -p command for the given source.
 func GitLog(source string, logOpts string) (<-chan *gitdiff.File, error) {
-	sourceClean := filepath.Clean(source)
-	var cmd *exec.Cmd
+	var args = []string{"log", "--patch", "--unified=0"}
 	if logOpts != "" {
-		args := []string{"-C", sourceClean, "log", "-p", "-U0"}
 		args = append(args, strings.Split(logOpts, " ")...)
-		cmd = exec.Command("git", args...)
 	} else {
-		cmd = exec.Command("git", "-C", sourceClean, "log", "-p", "-U0",
-			"--full-history", "--all")
+		args = append(args, "--full-history", "--all")
 	}
 
-	log.Debug().Msgf("executing: %s", cmd.String())
-
-	stdout, err := cmd.StdoutPipe()
+	var g, err = newGitter(source)
 	if err != nil {
 		return nil, err
 	}
-	stderr, err := cmd.StderrPipe()
+
+	var ctx, cancel = context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	bs, err := g.exec(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	go listenForStdErr(stderr)
-	// HACK: to avoid https://github.com/zricethezav/gitleaks/issues/722
-	time.Sleep(50 * time.Millisecond)
-
-	return gitdiff.Parse(stdout)
+	return gitdiff.Parse(bytes.NewReader(bs))
 }
 
 // GitDiff returns a channel of gitdiff.File objects from
 // the git diff command for the given source.
 func GitDiff(source string, staged bool) (<-chan *gitdiff.File, error) {
-	sourceClean := filepath.Clean(source)
-	var cmd *exec.Cmd
-	cmd = exec.Command("git", "-C", sourceClean, "diff", "-U0", ".")
+	var args = []string{"diff", "--unified=0"}
 	if staged {
-		cmd = exec.Command("git", "-C", sourceClean, "diff", "-U0",
-			"--staged", ".")
+		args = append(args, "--staged", ".")
+	} else {
+		args = append(args, ".")
 	}
-	log.Debug().Msgf("executing: %s", cmd.String())
 
-	stdout, err := cmd.StdoutPipe()
+	var g, err = newGitter(source)
 	if err != nil {
 		return nil, err
 	}
-	stderr, err := cmd.StderrPipe()
+
+	var ctx, cancel = context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	bs, err := g.exec(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	go listenForStdErr(stderr)
-	// HACK: to avoid https://github.com/zricethezav/gitleaks/issues/722
-	time.Sleep(50 * time.Millisecond)
-
-	return gitdiff.Parse(stdout)
+	return gitdiff.Parse(bytes.NewReader(bs))
 }
 
-// listenForStdErr listens for stderr output from git and prints it to stdout
-// then exits with exit code 1
-func listenForStdErr(stderr io.ReadCloser) {
-	scanner := bufio.NewScanner(stderr)
-	errEncountered := false
-	for scanner.Scan() {
-		// if git throws the following error:
-		//
-		//  exhaustive rename detection was skipped due to too many files.
-		//  you may want to set your diff.renameLimit variable to at least
-		//  (some large number) and retry the command.
-		//
-		// we skip exiting the program as git log -p/git diff will continue
-		// to send data to stdout and finish executing. This next bit of
-		// code prevents gitleaks from stopping mid scan if this error is
-		// encountered
-		if strings.Contains(scanner.Text(),
-			"exhaustive rename detection was skipped") ||
-			strings.Contains(scanner.Text(),
-				"you may want to set your diff.renameLimit") {
+func newGitter(dir string) (*gitter, error) {
+	const bin = "git"
+	var binPath, err = exec.LookPath(bin)
+	if err != nil {
+		return nil, fmt.Errorf("%s is required for executing: %w", bin, err)
+	}
+	dir = filepath.Clean(dir)
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("%s is not an absolute path: %w", dir, err)
+	}
+	var g = &gitter{
+		binPath: binPath,
+		path:    dir,
+	}
 
-			log.Warn().Msg(scanner.Text())
-		} else {
-			log.Error().Msg(scanner.Text())
-			errEncountered = true
+	var ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = g.exec(ctx, "config", "--add", "--global", "safe.directory", dir)
+	if err != nil {
+		return nil, err
+	}
+	_, err = g.exec(ctx, "config", "diff.renameLimit", strconv.FormatUint(uint64(math.MaxUint16), 10))
+	if err != nil {
+		return nil, err
+	}
+
+	return g, nil
+}
+
+type gitter struct {
+	binPath string
+	path    string
+}
+
+func (g *gitter) exec(ctx context.Context, args ...string) ([]byte, error) {
+	args = append([]string{"--no-pager", "-C", g.path}, args...)
+	var cmd = exec.CommandContext(ctx, g.binPath, args...)
+	cmd.Dir = g.path
+	bs, err := cmd.Output()
+	if err != nil {
+		var ee exec.ExitError
+		if !errors.Is(err, &ee) {
+			return nil, fmt.Errorf("error executing 'git %s': %w", strings.Join(args, " "), err)
 		}
+		return nil, fmt.Errorf("error executing 'git %s', output: %s : %w", strings.Join(args, " "), strings.TrimSpace(string(ee.Stderr)), err)
 	}
-	if errEncountered {
-		os.Exit(1)
-	}
+	return bs, nil
 }
