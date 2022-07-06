@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gitleaks/go-gitdiff/gitdiff"
@@ -81,9 +83,11 @@ func newGitter(dir string) (*gitter, error) {
 
 	var ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err = g.exec(ctx, "config", "--add", "--global", "safe.directory", dir)
-	if err != nil {
-		return nil, err
+	if !isDirectoryOwnedByCurrentUser(dir) {
+		_, err = g.exec(ctx, "config", "--add", "--global", "safe.directory", dir)
+		if err != nil {
+			return nil, err
+		}
 	}
 	_, err = g.exec(ctx, "config", "diff.renameLimit", strconv.FormatUint(uint64(math.MaxUint16), 10))
 	if err != nil {
@@ -104,11 +108,26 @@ func (g *gitter) exec(ctx context.Context, args ...string) ([]byte, error) {
 	cmd.Dir = g.path
 	bs, err := cmd.Output()
 	if err != nil {
-		var ee exec.ExitError
-		if !errors.Is(err, &ee) {
+		var ee = &exec.ExitError{}
+		if !errors.As(err, &ee) {
 			return nil, fmt.Errorf("error executing 'git %s': %w", strings.Join(args, " "), err)
 		}
 		return nil, fmt.Errorf("error executing 'git %s', output: %s : %w", strings.Join(args, " "), strings.TrimSpace(string(ee.Stderr)), err)
 	}
 	return bs, nil
+}
+
+func isDirectoryOwnedByCurrentUser(dir string) bool {
+	var info, err = os.Stat(dir)
+	if err != nil {
+		return false
+	}
+	if !info.IsDir() {
+		return false
+	}
+	var stat, ok = info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return int(stat.Uid) == os.Getuid()
 }
